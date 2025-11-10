@@ -1,3 +1,8 @@
+# >>> ADD: imports for HF SigLIP
+from typing import List, Optional
+from transformers import AutoModel, AutoProcessor
+import torch.nn.functional as F
+
 from collections import OrderedDict
 from typing import Tuple, Union
 
@@ -440,3 +445,117 @@ def build_model(state_dict: dict):
     convert_weights(model)
     model.load_state_dict(state_dict)
     return model.eval()
+
+class SigLIPForExplainability(nn.Module):
+    """
+    仅用 forward hook 读取注意力：
+      - vision encoder 每层 self_attn 的 attn_weights
+      - pooling head 的 torch.nn.MultiheadAttention 的 attn_weights
+    同时在权重张量上注册 backward hook 拿梯度，给文本条件化用。
+    """
+    def __init__(self, model_name: str = "google/siglip-base-patch16-224", device: Optional[torch.device] = None):
+        super().__init__()
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = AutoModel.from_pretrained(model_name).eval().to(self.device)
+        self.processor = AutoProcessor.from_pretrained(model_name)
+
+        # 缓存
+        self.attn_fwd: List[torch.Tensor] = []      # encoder 每层: [B,H,L,L]
+        self.attn_bwd: List[torch.Tensor] = []      # 对应梯度
+        self.pool_attn: Optional[torch.Tensor] = None      # pooling head: [B,H,1,S]（我们用 average_attn_weights=False）
+        self.pool_attn_grad: Optional[torch.Tensor] = None
+
+        # 网格信息（热图投影用）
+        vm_cfg = getattr(self.model, "vision_model", None)
+        self.patch_size = getattr(getattr(vm_cfg, "config", None), "patch_size", 16)
+        self.image_size = getattr(getattr(vm_cfg, "config", None), "image_size", 224)
+        self.grid_h = self.image_size // self.patch_size
+        self.grid_w = self.image_size // self.patch_size
+        self.has_cls = True  # 编码层是 ViT 风格（CLS 在 index 0）；pooling head 是 probe->tokens
+
+        self._attach_hooks()
+
+    def _attach_hooks(self):
+        """给 encoder 每层 self_attn 和 pooling head 的 MHA 注册 forward hook；并在 attn_weights 张量上注册 backward hook。"""
+        vm = self.model.vision_model
+
+        # 1) encoder 层 self_attn
+        for blk in vm.encoder.layers:
+            m = blk.self_attn  # HF 的 SiglipAttention 返回 (attn_output, attn_weights)
+            def enc_fw_hook(module, inputs, output):
+                attn = None
+                if isinstance(output, tuple) and len(output) >= 2:
+                    attn = output[1]  # [B,H,L,L]
+                if attn is not None:
+                    self.attn_fwd.append(attn.detach())
+                    attn.register_hook(lambda g: self.attn_bwd.append(g.detach()))
+            m.register_forward_hook(enc_fw_hook)
+
+        # 2) pooling head 的 torch.nn.MultiheadAttention
+        if getattr(vm, "use_head", True) and hasattr(vm, "head"):
+            mha = vm.head.attention  # torch.nn.MultiheadAttention
+            def pool_fw_hook(module, inputs, output):
+                # output: (attn_output, attn_weights)
+                if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+                    # 注意：要拿到 per-head 权重，forward 里需设置 average_attn_weights=False（见下方调用）
+                    self.pool_attn = output[1].detach()      # [B,H,1,S]
+                    output[1].register_hook(lambda g: setattr(self, "pool_attn_grad", g.detach()))
+            mha.register_forward_hook(pool_fw_hook)
+
+    @torch.no_grad()
+    def encode_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        out = self.model.vision_model(pixel_values=pixel_values.to(self.device), return_dict=True)
+        img = out.pooler_output if hasattr(out, "pooler_output") else out.last_hidden_state[:, 0]
+        return F.normalize(img, dim=-1)
+
+    @torch.no_grad()
+    def encode_text(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        out = self.model.text_model(
+            input_ids=input_ids.to(self.device),
+            attention_mask=None if attention_mask is None else attention_mask.to(self.device),
+            return_dict=True,
+        )
+        txt = out.pooler_output if hasattr(out, "pooler_output") else out.last_hidden_state[:, -1]
+        return F.normalize(txt, dim=-1)
+
+    def forward(self, images=None, texts=None):
+        """
+        便捷前向：走 processor，返回 (logits_per_image, logits_per_text)。
+        注意：这里只前向；要拿梯度，请对 similarity_score() 的返回 backward()。
+        """
+        if images is None or texts is None:
+            raise ValueError("Pass both images and texts")
+
+        batch = self.processor(images=images, text=texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+
+        # 每次前向前清空缓存（pool_attn 也清）
+        self.attn_fwd.clear(); self.attn_bwd.clear()
+        self.pool_attn = None; self.pool_attn_grad = None
+
+        # 正常前向（hooks 会自动捕获注意力）
+        out = self.model(**batch, return_dict=True)
+
+        img = F.normalize(out.image_embeds, dim=-1)
+        txt = F.normalize(out.text_embeds,  dim=-1)
+
+        logit_scale = getattr(self.model, "logit_scale", None)
+        scale = logit_scale.exp().item() if isinstance(logit_scale, torch.Tensor) else 1.0
+        logits_per_image = scale * (img @ txt.t())
+        logits_per_text  = scale * (txt @ img.t())
+        return logits_per_image, logits_per_text
+
+    def similarity_score(self, images, texts):
+        """
+        文本条件化的标量分数（cos 相似度 batch-mean）。
+        对其 backward() 之后，self.attn_bwd / self.pool_attn_grad 会被填充。
+        """
+        batch = self.processor(images=images, text=texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+        out = self.model(**batch, return_dict=True)
+        img = F.normalize(out.image_embeds, dim=-1)
+        txt = F.normalize(out.text_embeds,  dim=-1)
+        return (img * txt).sum(dim=-1).mean()
+
+
+def build_siglip(model_name: str = "google/siglip-base-patch16-224", device: Optional[torch.device] = None):
+    """工厂函数（保持原 CLIP 路线不变）"""
+    return SigLIPForExplainability(model_name=model_name, device=device)

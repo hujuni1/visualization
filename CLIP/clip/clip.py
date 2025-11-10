@@ -11,8 +11,11 @@ from tqdm import tqdm
 
 from .model import build_model
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
+# ADD:
+from transformers import AutoModel, AutoProcessor
 
-__all__ = ["available_models", "load", "tokenize"]
+#__all__ = ["available_models", "load", "tokenize"]
+__all__ = ["available_models", "load", "tokenize", "load_siglip"]  # ADD load_siglip
 _tokenizer = _Tokenizer()
 
 _MODELS = {
@@ -193,3 +196,43 @@ def tokenize(texts: Union[str, List[str]], context_length: int = 77) -> torch.Lo
         result[i, :len(tokens)] = torch.tensor(tokens)
 
     return result
+
+# ADD:
+def load_siglip(model_name: str = "google/siglip-base-patch16-224",
+                device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu"):
+    """
+    加载 HuggingFace SigLIP，并在 vision pooling head 的 MultiheadAttention 上挂 forward hook，
+    以便获取 attention weights（以及其梯度，用于文本条件化）。
+    返回: (hf_model, preprocess_fn)
+    - hf_model: transformers 的 AutoModel（eval/to(device)）
+    - preprocess_fn: 把 PIL.Image -> torch.FloatTensor(3,H,W)（与本文件 load() 返回的 preprocess 对齐风格）
+    """
+    model = AutoModel.from_pretrained(model_name).eval().to(device)
+    processor = AutoProcessor.from_pretrained(model_name)
+
+    # --- attach forward hook on pooling head (torch.nn.MultiheadAttention) ---
+    # 说明：HF 结构: model.vision_model.vision_model.head.attention
+    head = model.vision_model.vision_model.head
+    mha = head.attention
+
+    # 缓存到 head 上，方便外部读取
+    head.last_attn = None
+    head.last_attn_grad = None
+
+    def _pool_fw_hook(mod, inputs, outputs):
+        # outputs: (attn_output, attn_weights)
+        attn_w = outputs[1]
+        head.last_attn = attn_w.detach()
+        attn_w.register_hook(lambda g: setattr(head, "last_attn_grad", g.detach()))
+
+    mha.register_forward_hook(_pool_fw_hook)
+
+    # --- 提供一个与本文件风格一致的 preprocess，用于 PIL -> Tensor ---
+    # 注意：Chefer 的管线常用的是 "预处理函数 + 手工打包 batch"
+    def _preprocess_pil(image: Image.Image):
+        # 用 HF 的 processor 得到 pixel_values，然后取 batch[0]，保持 (C,H,W) tensor 风格
+        batch = processor(images=image, return_tensors="pt")
+        # 返回单张图的 pixel_values 张量（不做 .to(device)，保持跟原 load() 返回 preprocess 一致）
+        return batch["pixel_values"][0]
+
+    return model, _preprocess_pil
